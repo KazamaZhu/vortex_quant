@@ -1,14 +1,17 @@
 """Phase 0 — runtime 模块测试（workspace / database / task_queue / server）。"""
 from __future__ import annotations
 
+import json
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from vortex.data.manifest import SyncManifest
 from vortex.runtime.database import Database
-from vortex.runtime.task_queue import TaskQueue, TaskStatus, make_resource_key
+from vortex.runtime.task_queue import TaskProgress, TaskQueue, TaskStatus, make_resource_key
 from vortex.runtime.workspace import Workspace
 
 
@@ -240,27 +243,86 @@ class TestServer:
         server._draining = False
         server.stop()
 
-    def test_stale_task_recovery(self, tmp_path):
-        """模拟崩溃恢复：启动时 RUNNING 任务应被标记为 interrupted。"""
+    def test_stale_task_recovery_marks_dead_worker_failed_and_syncs_manifest(
+        self, monkeypatch, tmp_path
+    ):
+        """worker 已死时，server 启动应回收 RUNNING 任务并同步 manifest。"""
         from vortex.runtime.server import Server
 
-        server = Server(tmp_path / "ws")
-        server.start()
-        # 直接插入一个 RUNNING 任务模拟崩溃残留
-        server.db.execute(
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        manifest.create_run("run_x", "default", "bootstrap")
+        manifest.update_status("run_x", "running")
+        manifest.close()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        db.execute(
             """INSERT INTO task_queue (task_id, domain, action, profile, status, run_id, resource_key)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             ("stale-task", "data", "bootstrap", "default", "running", "run_x", "data:default:bootstrap"),
         )
-        server.stop()
+        db.execute(
+            "UPDATE task_queue SET progress_json = ? WHERE task_id = ?",
+            (
+                json.dumps(TaskProgress(run_id="run_x", pid=43210).to_dict(), ensure_ascii=False),
+                "stale-task",
+            ),
+        )
+        db.close()
 
-        # 重新启动 — 应恢复 stale task
-        server2 = Server(tmp_path / "ws")
-        server2.start()
-        task = server2.task_queue.get_task("stale-task")
+        monkeypatch.setattr(Server, "_is_pid_alive", lambda self, pid: False)
+
+        server = Server(root)
+        server.start()
+        task = server.task_queue.get_task("stale-task")
         assert task["status"] == "failed"
         assert "interrupted" in task["error"]
-        server2.stop()
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        run = manifest.get_run("run_x")
+        manifest.close()
+        assert run is not None
+        assert run["status"] == "failed"
+        assert "interrupted" in str(run["error_message"])
+
+        server.stop()
+
+    def test_stale_task_recovery_keeps_alive_worker_running(self, monkeypatch, tmp_path):
+        """worker 仍存活时，server 启动不应误判 interrupted。"""
+        from vortex.runtime.server import Server
+
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        db.execute(
+            """INSERT INTO task_queue (task_id, domain, action, profile, status, run_id, resource_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("alive-task", "data", "bootstrap", "default", "running", "run_alive", "data:default:bootstrap"),
+        )
+        db.execute(
+            "UPDATE task_queue SET progress_json = ? WHERE task_id = ?",
+            (
+                json.dumps(TaskProgress(run_id="run_alive", pid=43210).to_dict(), ensure_ascii=False),
+                "alive-task",
+            ),
+        )
+        db.close()
+
+        monkeypatch.setattr(Server, "_is_pid_alive", lambda self, pid: int(pid) == 43210)
+
+        server = Server(root)
+        server.start()
+        task = server.task_queue.get_task("alive-task")
+        assert task["status"] == "running"
+        assert task["error"] is None
+
+        server.task_queue.update_status("alive-task", TaskStatus.CANCELLED)
+        server.stop()
 
     def test_double_start_fails(self, tmp_path):
         """同一 workspace 不允许启动两个实例（PID 文件互斥）。"""
@@ -272,3 +334,63 @@ class TestServer:
         with pytest.raises(RuntimeError, match="already running"):
             server2.start()
         server1.stop()
+
+    def test_schedule_matches_datetime_supports_common_cron_patterns(self):
+        from vortex.runtime.server import schedule_matches_datetime
+
+        assert schedule_matches_datetime(
+            "0 18 * * 1-5",
+            datetime(2026, 4, 17, 18, 0),
+        )
+        assert not schedule_matches_datetime(
+            "0 18 * * 1-5",
+            datetime(2026, 4, 18, 18, 0),
+        )
+        assert schedule_matches_datetime(
+            "*/15 6 * * *",
+            datetime(2026, 4, 19, 6, 45),
+        )
+
+    def test_scheduler_tick_submits_due_profile_only_once_per_minute(
+        self, monkeypatch, tmp_path
+    ):
+        from vortex.runtime.server import Server
+
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+        (root / "profiles" / "default.yaml").write_text(
+            "provider: tushare\nhistory_start: '20170101'\nschedule: '0 18 * * 1-5'\n",
+            encoding="utf-8",
+        )
+
+        submitted: list[str] = []
+        monkeypatch.setattr(
+            Server,
+            "_submit_scheduled_update",
+            lambda self, profile_name: submitted.append(profile_name) or {"status": "submitted"},
+        )
+
+        server = Server(root)
+        server.start()
+        assert server._run_scheduler_tick(datetime(2026, 4, 17, 18, 0)) == 1
+        assert server._run_scheduler_tick(datetime(2026, 4, 17, 18, 0, 30)) == 0
+        assert submitted == ["default"]
+        server.stop()
+
+    def test_status_reports_schedule_enabled_profiles(self, tmp_path):
+        from vortex.runtime.server import Server
+
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+        (root / "profiles" / "default.yaml").write_text(
+            "provider: tushare\nhistory_start: '20170101'\nschedule: '0 21 * * 1-5'\n",
+            encoding="utf-8",
+        )
+
+        server = Server(root)
+        server.start()
+        info = server.status()
+        assert info["scheduled_profiles"] == [
+            {"name": "default", "schedule": "0 21 * * 1-5"}
+        ]
+        server.stop()
