@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vortex 控制台</title>
+  <link rel="stylesheet" href="/styles.css?v=20260424g" />
+</head>
+<body>
+  <header>
+    <h1>Vortex 控制台</h1>
+    <p class="muted">数据拉取可选「Profile 默认」或勾选数据集；任务默认后台执行。</p>
+  </header>
+
+  <section class="panel">
+    <h2>工作区</h2>
+    <label>
+      根目录 <code>--root</code>（数据落在 <code>此目录/data/</code>）
+      <input type="text" id="root" placeholder="默认 ~/Documents/vortex_workspace" autocomplete="off" />
+    </label>
+    <label>
+      数据 Profile <code>--profile</code>（留空为 default）
+      <input type="text" id="data-profile" placeholder="default" autocomplete="off" />
+    </label>
+    <div class="row">
+      <button type="button" id="btn-summary">刷新摘要</button>
+      <button type="button" id="btn-profile">解析 data profile</button>
+      <button type="button" id="btn-explain">Explain profile</button>
+    </div>
+  </section>
+
+  <section class="panel panel-active-tasks">
+    <h2>活跃数据任务</h2>
+    <p class="muted small">
+      展示当前队列中「待处理 / 运行中」的数据任务及进度摘要。长时间无更新会标黄；可点<strong>日志</strong>在下方打开尾部，或<strong>取消</strong>终止。
+    </p>
+    <div class="row">
+      <button type="button" id="btn-active-refresh">刷新列表</button>
+      <label class="inline">
+        <input type="checkbox" id="active-auto-refresh" />
+        每 5 秒自动刷新
+      </label>
+    </div>
+    <p id="active-tasks-status" class="muted small active-tasks-line"></p>
+    <div id="active-tasks-list" class="active-tasks-list"></div>
+  </section>
+
+  <section class="panel panel-data">
+    <h2>数据拉取（落盘）</h2>
+    <p class="muted small">
+      先点「加载数据集列表」；新手建议选「使用 Profile 默认」，与 <code>vortex data bootstrap</code> 不写 <code>--datasets</code> 一致。
+    </p>
+
+    <div class="row">
+      <button type="button" id="btn-load-catalog">加载数据集列表</button>
+      <span id="catalog-status" class="muted small"></span>
+    </div>
+
+    <fieldset class="ds-mode">
+      <legend>本次要拉哪些表</legend>
+      <label class="inline">
+        <input type="radio" name="ds-mode" value="profile" checked />
+        使用 Profile 默认（推荐，不限制 datasets）
+      </label>
+      <label class="inline">
+        <input type="radio" name="ds-mode" value="custom" />
+        自定义勾选（等价 <code>--datasets</code>）
+      </label>
+    </fieldset>
+
+    <div id="dataset-toolbar" class="row hidden">
+      <span class="toolbar-label">快捷：</span>
+      <button type="button" class="btn-sm" id="preset-minimal">最小入门</button>
+      <button type="button" class="btn-sm" id="preset-priority">优先推荐</button>
+      <button type="button" class="btn-sm" id="preset-default">当前账号默认可拉</button>
+      <button type="button" class="btn-sm" id="preset-all-visible">全选列表</button>
+      <button type="button" class="btn-sm" id="preset-none">全不选</button>
+      <span id="ds-count" class="muted small"></span>
+    </div>
+
+    <div id="dataset-list" class="dataset-list hidden"></div>
+
+    <details class="advanced">
+      <summary>高级：手动输入 datasets（逗号分隔，覆盖勾选）</summary>
+      <input type="text" id="datasets-manual" placeholder="留空则按上面规则；填写则优先使用本框" />
+    </details>
+
+    <h3 class="subh">常用操作</h3>
+    <div class="row">
+      <button type="button" id="btn-status">查看同步状态</button>
+      <button type="button" class="primary" id="btn-bootstrap">首次全量 Bootstrap（后台）</button>
+      <button type="button" id="btn-update">增量 Update（后台）</button>
+    </div>
+    <div class="row">
+      <button type="button" id="btn-bootstrap-dry">仅测算（Bootstrap dry-run，前台）</button>
+      <label class="inline"><input type="checkbox" id="foreground-publish" /> Publish 用前台子进程</label>
+      <button type="button" id="btn-publish">发布快照 Publish</button>
+    </div>
+
+    <h3 class="subh">按日期补数 / 修复</h3>
+    <p class="muted small">日期可用下方选择器，自动转为 YYYYMMDD。</p>
+    <div class="row date-row">
+      <label>开始 <input type="date" id="start-date" /></label>
+      <label>结束 <input type="date" id="end-date" /></label>
+    </div>
+    <div class="row">
+      <button type="button" id="btn-backfill">Backfill 补数（后台）</button>
+      <button type="button" id="btn-repair">Repair 修复（后台）</button>
+    </div>
+
+    <h3 class="subh">任务日志 / 取消</h3>
+    <p class="muted small">
+      后台拉数<strong>没有浏览器进度条</strong>：点 Bootstrap/Update 等成功后，响应里会有
+      <code>task_id</code> 与 <code>log_path</code>。下方可一键看日志尾部，或开启轮询近似「跟着跑」。
+    </p>
+    <label>
+      任务 ID <code>task_id</code>（可选）
+      <input type="text" id="task-id" placeholder="留空则由 CLI 取默认任务" />
+    </label>
+    <div class="row">
+      <button type="button" id="btn-logs">查看日志（JSON）</button>
+      <button type="button" id="btn-logs-poll">开始轮询日志（每 3 秒）</button>
+      <button type="button" id="btn-cancel">取消活跃任务</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>初始化工作区</h2>
+    <p class="muted">等价 <code>vortex init --non-interactive</code></p>
+    <button type="button" id="btn-init">Init（非交互）</button>
+  </section>
+
+  <section class="panel panel-backtest">
+    <h2>回测结果</h2>
+    <p class="muted small">选择交易策略类型和回测引擎，运行后在同一面板查看结果。</p>
+    <div class="backtest-form">
+      <label>
+        股票代码
+        <input type="text" id="bt-code" value="600396" autocomplete="off" />
+      </label>
+      <label>
+        训练起始
+        <input type="text" id="bt-train-start" value="20180101" autocomplete="off" />
+      </label>
+      <label>
+        回测起始
+        <input type="text" id="bt-test-start" value="20250423" autocomplete="off" />
+      </label>
+      <label>
+        策略类型
+        <select id="bt-strategy">
+          <option value="price_volume">量价择时</option>
+          <option value="t_strategy">K线形态 + 主力资金 做T v1</option>
+        </select>
+      </label>
+      <label>
+        回测引擎
+        <select id="bt-engine">
+          <option value="vortex">Vortex 内置</option>
+          <option value="akquant">AKQuant</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <button type="button" id="btn-bt-refresh">刷新结果</button>
+      <button type="button" class="primary" id="btn-bt-run">运行策略回测</button>
+      <label class="inline">
+        <input type="checkbox" id="bt-no-fetch" />
+        复用本地数据
+      </label>
+      <span id="bt-status" class="muted small"></span>
+    </div>
+    <div id="bt-fetch-summary" class="bt-fetch-summary hidden"></div>
+    <div id="bt-results" class="bt-results"></div>
+      <div id="bt-detail" class="bt-detail hidden">
+        <div id="bt-report-row" class="bt-report-row hidden">
+          <button type="button" id="btn-open-akquant-report">打开 AKQuant 报告</button>
+          <a id="bt-report-link" class="bt-report-link" href="#" target="_blank" rel="noopener noreferrer">报告直达</a>
+          <button type="button" id="btn-open-kline-report">打开K线趋势</button>
+          <a id="bt-kline-link" class="bt-report-link" href="#" target="_blank" rel="noopener noreferrer">K线直达</a>
+        </div>
+        <div id="bt-metrics" class="bt-metrics"></div>
+      <p id="bt-paths" class="muted small"></p>
+      <p id="bt-note" class="muted small"></p>
+    </div>
+    <div id="t-detail" class="bt-detail hidden">
+      <h3 class="subh">做T模型 v1</h3>
+      <div id="t-metrics" class="bt-metrics"></div>
+      <div id="t-signals" class="t-signals"></div>
+      <p id="t-paths" class="muted small"></p>
+    </div>
+  </section>
+
+  <section class="panel output">
+    <h2>输出</h2>
+    <p class="muted small">
+      查看/轮询日志时，<strong>真正进度在下方「任务日志（可读）」</strong>；再往下才是接口原始 JSON（排障用）。
+    </p>
+    <div id="log-tail-panel" class="log-tail-panel hidden" aria-live="polite">
+      <h3 class="log-tail-title">任务日志（可读）</h3>
+      <p class="muted small" id="log-meta"></p>
+      <pre id="log-tail" class="log-tail-pre"></pre>
+    </div>
+    <p class="muted small out-tech-label">技术详情（子进程返回）</p>
+    <pre id="out"></pre>
+  </section>
+
+  <script src="/app.js?v=20260424j"></script>
+</body>
+</html>
